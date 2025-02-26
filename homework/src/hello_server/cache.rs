@@ -19,7 +19,7 @@ pub struct Cache<K, V> {
 impl<K, V> Default for Cache<K, V> {
     fn default() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new())
+            inner: RwLock::new(HashMap::new()),
         }
     }
 }
@@ -50,20 +50,20 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
             let r_value = value_lock.read().unwrap();
             return r_value.as_ref().unwrap().clone();
         }
-        
 
-        { // create a value lock if there is not an entry with None content
+        {
+            // create a value lock if there is not an entry with None content
             let value_lock = Arc::new(RwLock::new(None));
             let mut value = value_lock.write().unwrap();
-            { // insert None value_lock
+            {
+                // insert None value_lock
                 let mut w_cache = self.inner.write().unwrap();
                 match w_cache.entry(key.clone()) {
                     Entry::Occupied(entry) => {
                         // some other threads have already insert the value
                         let value_lock = entry.get();
-                        return value_lock.read().unwrap()
-                                        .as_ref().unwrap().clone();
-                    },
+                        return value_lock.read().unwrap().as_ref().unwrap().clone();
+                    }
                     Entry::Vacant(entry) => {
                         entry.insert(value_lock.clone());
                     }
