@@ -1,5 +1,6 @@
 //! Thread-safe key/value cache.
 
+use std::char::REPLACEMENT_CHARACTER;
 use std::collections::hash_map::{Entry, HashMap};
 use std::hash::Hash;
 use std::sync::{Arc, Mutex, RwLock};
@@ -9,13 +10,16 @@ use std::sync::{Arc, Mutex, RwLock};
 pub struct Cache<K, V> {
     // todo! This is an example cache type. Build your own cache type that satisfies the
     // specification for `get_or_insert_with`.
-    inner: Mutex<HashMap<K, V>>,
+    /// `None` mean no value yet.
+    /// Getting or updating `HashMap` value should always use read lock of hashmap.
+    /// Only inserting value into HashMap should use write lock of hashmap.
+    inner: RwLock<HashMap<K, Arc<RwLock<Option<V>>>>>,
 }
 
 impl<K, V> Default for Cache<K, V> {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: RwLock::new(HashMap::new())
         }
     }
 }
@@ -36,6 +40,39 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
     ///
     /// [`Entry`]: https://doc.rust-lang.org/stable/std/collections/hash_map/struct.HashMap.html#method.entry
     pub fn get_or_insert_with<F: FnOnce(K) -> V>(&self, key: K, f: F) -> V {
-        todo!()
+        // read if there is an entry
+        let value_status = {
+            let r_cache = self.inner.read().unwrap();
+            r_cache.get(&key).cloned() // inevitable clone
+            // release cache read lock here
+        };
+        if let Some(value_lock) = value_status {
+            let r_value = value_lock.read().unwrap();
+            return r_value.as_ref().unwrap().clone();
+        }
+        
+
+        { // create a value lock if there is not an entry with None content
+            let value_lock = Arc::new(RwLock::new(None));
+            let mut value = value_lock.write().unwrap();
+            { // insert None value_lock
+                let mut w_cache = self.inner.write().unwrap();
+                match w_cache.entry(key.clone()) {
+                    Entry::Occupied(entry) => {
+                        // some other threads have already insert the value
+                        let value_lock = entry.get();
+                        return value_lock.read().unwrap()
+                                        .as_ref().unwrap().clone();
+                    },
+                    Entry::Vacant(entry) => {
+                        entry.insert(value_lock.clone());
+                    }
+                }
+                // release w_cache write lock here
+            }
+            let new_value = f(key);
+            *value = Some(new_value.clone());
+            return new_value;
+        }
     }
 }
