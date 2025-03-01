@@ -72,7 +72,7 @@ impl<K: Eq + Hash + Clone, V: Clone> Cache<K, V> {
             }
             let new_value = f(key);
             *value = Some(new_value.clone());
-            return new_value;
+            new_value
         }
     }
 }

@@ -85,14 +85,10 @@ impl ThreadPool {
             let pool_inner = pool_inner.clone();
 
             let thread = thread::spawn(move || {
-                loop {
-                    if let Ok(job) = job_receiver.recv() {
-                        pool_inner.start_job();
-                        job.0();
-                        pool_inner.finish_job();
-                    } else {
-                        break;
-                    }
+                while let Ok(job) = job_receiver.recv() {
+                    pool_inner.start_job();
+                    job.0();
+                    pool_inner.finish_job();
                 }
             });
             _workers.push(Worker {

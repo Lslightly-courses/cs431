@@ -41,7 +41,7 @@ impl CancellableTcpListener {
         self.is_canceled.store(true, Ordering::Release);
         let local_addr = self.inner.local_addr()?;
         let tcp_stream = TcpStream::connect(local_addr)?;
-        
+
         Ok(())
     }
 
