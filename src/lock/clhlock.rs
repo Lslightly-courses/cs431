@@ -23,7 +23,7 @@ pub struct ClhLock {
 
 impl Node {
     fn new(locked: bool) -> *mut CachePadded<Self> {
-        Box::into_raw(Box::new(CachePadded::new(Self {
+        Box::into_raw(Box::new(CachePadded::new(Self { // Box allocated in heap
             locked: AtomicBool::new(locked),
         })))
     }

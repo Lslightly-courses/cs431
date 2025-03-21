@@ -25,7 +25,7 @@ unsafe impl RawLock for TicketLock {
     type Token = usize;
 
     fn lock(&self) -> usize {
-        let ticket = self.next.fetch_add(1, Relaxed);
+        let ticket = self.next.fetch_add(1, Relaxed); // fetch_add is fair => TicketLock is fair. fetch_add is not fair => TicketLock is not fair
         let backoff = Backoff::new();
 
         while self.curr.load(Acquire) != ticket {

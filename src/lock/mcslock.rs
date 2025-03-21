@@ -74,7 +74,7 @@ unsafe impl RawLock for McsLock {
             if self
                 .tail
                 .compare_exchange(node, ptr::null_mut(), Release, Relaxed)
-                .is_ok()
+                .is_ok() // no other thread is waiting, set tail to null
             {
                 // SAFETY: Since `node` was the `tail`, there is no other thread blocked by this
                 // lock. Hence we have unique access to it.
@@ -82,6 +82,7 @@ unsafe impl RawLock for McsLock {
                 return;
             }
 
+            // another thread succeed in swap tail but not set prev yet
             while {
                 next = unsafe { (*node).next.load(Acquire) };
                 next.is_null()

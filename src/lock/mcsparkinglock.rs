@@ -92,6 +92,7 @@ unsafe impl RawLock for McsParkingLock {
 
         // It is important to clone the thread before unlocking, the next waiter,
         // because then the next waiter may free `next_ref`.
+        // If not, use after free may occur if next_ref quickly unlock.
         let thread = next_ref.thread.clone();
         next_ref.locked.store(false, Release);
         thread.unpark();
