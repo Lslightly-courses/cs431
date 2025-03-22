@@ -174,6 +174,7 @@ struct ArcInner<T> {
     data: T,
 }
 
+// count and data are both sync/send
 unsafe impl<T: Sync + Send> Send for ArcInner<T> {}
 unsafe impl<T: Sync + Send> Sync for ArcInner<T> {}
 
@@ -208,14 +209,18 @@ impl<T> Arc<T> {
     /// ```
     #[inline]
     pub fn get_mut(this: &mut Self) -> Option<&mut T> {
-        todo!()
+        if this.inner().count.load(Ordering::Acquire) == 1 {
+            Some(unsafe { Self::get_mut_unchecked(this) })
+        } else {
+            None
+        }
     }
 
     // Used in `get_mut` and `make_mut` to check if the given `Arc` is the unique reference to the
     // underlying data.
     #[inline]
     fn is_unique(&mut self) -> bool {
-        todo!()
+        self.inner().count.load(Ordering::Acquire) == 1
     }
 
     /// Returns a mutable reference into the given `Arc` without any check.
@@ -266,7 +271,7 @@ impl<T> Arc<T> {
     /// ```
     #[inline]
     pub fn count(this: &Self) -> usize {
-        todo!()
+        this.inner().count.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -317,7 +322,13 @@ impl<T> Arc<T> {
     /// ```
     #[inline]
     pub fn try_unwrap(this: Self) -> Result<T, Self> {
-        todo!()
+        if Self::count(&this) == 1 {
+            let res = Ok(unsafe { Box::from_raw(this.ptr.as_ptr()).data });
+            mem::forget(this);
+            res
+        } else {
+            Err(this)
+        }
     }
 }
 
@@ -349,7 +360,26 @@ impl<T: Clone> Arc<T> {
     /// ```
     #[inline]
     pub fn make_mut(this: &mut Self) -> &mut T {
-        todo!()
+        /*
+           pub struct Arc<T> {
+               ptr: NonNull<ArcInner<T>>,
+               phantom: PhantomData<ArcInner<T>>,
+           }
+           struct ArcInner<T> {
+               count: AtomicUsize,
+               data: T,
+           }
+        */
+        if !this.is_unique() {
+            *this = Self::from_inner(
+                NonNull::new(Box::into_raw(Box::new(ArcInner {
+                    count: AtomicUsize::new(1),
+                    data: this.inner().data.clone(),
+                })))
+                .unwrap(),
+            );
+        }
+        unsafe { Self::get_mut_unchecked(this) }
     }
 }
 
@@ -374,7 +404,8 @@ impl<T> Clone for Arc<T> {
     /// ```
     #[inline]
     fn clone(&self) -> Arc<T> {
-        todo!()
+        self.inner().count.fetch_add(1, Ordering::AcqRel);
+        Self::from_inner(self.ptr)
     }
 }
 
@@ -413,7 +444,14 @@ impl<T> Drop for Arc<T> {
     /// drop(foo2);   // Prints "dropped!"
     /// ```
     fn drop(&mut self) {
-        todo!()
+        self.inner().count.fetch_sub(1, Ordering::AcqRel);
+        if self.inner().count.load(Ordering::Acquire) == 0 {
+            unsafe {
+                // drop the inner value
+                drop(Box::from_raw(self.ptr.as_ptr()));
+                println!("dropped!")
+            }
+        }
     }
 }
 
