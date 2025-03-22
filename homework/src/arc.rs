@@ -296,7 +296,7 @@ impl<T> Arc<T> {
     /// ```
     #[inline]
     pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        this.ptr.as_ptr() == other.ptr.as_ptr()
+        std::ptr::eq(this.ptr.as_ptr(), other.ptr.as_ptr())
     }
 
     /// Returns the inner value, if the given `Arc` is unique.
