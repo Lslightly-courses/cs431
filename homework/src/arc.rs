@@ -444,8 +444,13 @@ impl<T> Drop for Arc<T> {
     /// drop(foo2);   // Prints "dropped!"
     /// ```
     fn drop(&mut self) {
-        self.inner().count.fetch_sub(1, Ordering::AcqRel);
-        if self.inner().count.load(Ordering::Acquire) == 0 {
+        // TODO: reason not known yet
+        // The following code does not work in check-loom mode.
+        // self.inner().count.fetch_sub(1, Ordering::AcqRel);
+        // if self.inner().count.load(Ordering::Acquire) == 0 {
+
+        // pass the test in check-loom mode
+        if self.inner().count.fetch_sub(1, Ordering::AcqRel) == 1 {
             unsafe {
                 // drop the inner value
                 drop(Box::from_raw(self.ptr.as_ptr()));
