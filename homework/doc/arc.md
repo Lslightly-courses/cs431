@@ -23,8 +23,10 @@ Follow [the Arc section of the Rustnomicon (the book on unsafe Rust)][nomicon-ar
 
 Some food for thought on Rustnomicon's description:
 * Quiz: Why does `Arc<T> : Sync` require `T : Send`?
+  * `Arc<Rc<u32>>`: if Rc is allowed, Rc can be sent to another thread, which is not thread-safe.
 * The [Layout section](https://doc.rust-lang.org/nomicon/arc-mutex/arc-layout.html) explains
   why [`NonNull`](https://doc.rust-lang.org/std/ptr/struct.NonNull.html) and `PhantomData` are necessary.
+    to use covariant feature. to represent ownership semantics
   We don't care about them in this course and will not ask about them in the exams
   (it's quite interesting, though).
 * Their implementation uses `fence(Acquire)`, which we may not be able cover in the lecture due to time constraints.
