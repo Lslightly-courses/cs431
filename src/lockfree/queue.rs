@@ -46,7 +46,7 @@ impl<T> Default for Queue<T> {
 impl<T> Queue<T> {
     /// Create a new, empty queue.
     pub fn new() -> Self {
-        let sentinel = Box::into_raw(Box::new(Node {
+        let sentinel = Box::into_raw(Box::new(Node { // dummy node
             data: MaybeUninit::uninit(),
             next: Atomic::null(),
         }))
@@ -59,7 +59,7 @@ impl<T> Queue<T> {
     }
 
     /// Adds `t` to the back of the queue.
-    pub fn push(&self, t: T, guard: &mut Guard) {
+    pub fn push(&self, t: T, guard: &mut Guard) { // `guard` is used as a proof to access shared data
         let mut new = Owned::new(Node {
             data: MaybeUninit::new(t),
             next: Atomic::null(),
@@ -67,7 +67,7 @@ impl<T> Queue<T> {
 
         loop {
             // We push onto the tail, so we'll start optimistically by looking there first.
-            let tail = self.tail.load(Acquire, guard);
+            let tail = self.tail.load(Acquire, guard); // latest value of tail
 
             // Attempt to push onto the `tail` snapshot; fails if `tail.next` has changed.
             let tail_ref = unsafe { tail.deref() };
@@ -77,20 +77,20 @@ impl<T> Queue<T> {
             if !next.is_null() {
                 let _ = self
                     .tail
-                    .compare_exchange(tail, next, Release, Relaxed, guard);
+                    .compare_exchange(tail, next, Release, Relaxed, guard); // release match with let next
                 continue;
             }
 
             // looks like the actual tail; attempt to link at `tail.next`.
             match tail_ref
                 .next
-                .compare_exchange(Shared::null(), new, Release, Relaxed, guard)
+                .compare_exchange(Shared::null(), new, Release, Relaxed, guard) // release match with let mut new
             {
                 Ok(new) => {
                     // try to move the tail pointer forward.
                     let _ = self
                         .tail
-                        .compare_exchange(tail, new, Release, Relaxed, guard);
+                        .compare_exchange(tail, new, Release, Relaxed, guard); // release match with let mut new
                     break;
                 }
                 Err(e) => new = e.new,
@@ -104,13 +104,13 @@ impl<T> Queue<T> {
     /// Returns `None` if the queue is observed to be empty.
     pub fn try_pop(&self, guard: &mut Guard) -> Option<T> {
         loop {
-            let head = self.head.load(Acquire, guard);
-            let next = unsafe { head.deref() }.next.load(Acquire, guard);
+            let head = self.head.load(Acquire, guard); // latest value of head
+            let next = unsafe { head.deref() }.next.load(Acquire, guard); // latest value of next
 
             let next_ref = unsafe { next.as_ref() }?;
 
             // Moves `tail` if it's stale. Relaxed load is enough because if tail == head, then the
-            // messages for that node are already acquired.
+            // messages for that node are already acquired. head is acquired, head can not be more updated than tail
             let tail = self.tail.load(Relaxed, guard);
             if tail == head {
                 let _ = self

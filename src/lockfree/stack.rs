@@ -40,7 +40,7 @@ impl<T> Stack<T> {
 
     /// Pushes a value on top of the stack.
     pub fn push(&self, t: T) {
-        let mut node = Owned::new(Node {
+        let mut node = Owned::new(Node { // heap allocation
             data: MaybeUninit::new(t),
             next: ptr::null(),
         });
@@ -73,7 +73,7 @@ impl<T> Stack<T> {
 
         loop {
             let head = self.head.load(Acquire, &guard);
-            let h = unsafe { head.as_ref() }?;
+            let h = unsafe { head.as_ref() }?; // return None here if head is null
             let next = Shared::from(h.next);
 
             if self
