@@ -1,10 +1,13 @@
 //! Concurrent Owner (Cown) type.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::Ordering::SeqCst;
+use core::sync::atomic::Ordering::{Relaxed, SeqCst};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 use core::{fmt, hint, ptr};
+use std::mem;
 use std::sync::Arc;
+
+use rayon::spawn;
 
 /// A trait representing a `Cown`.
 ///
@@ -56,7 +59,22 @@ impl Request {
     /// `behavior` must be a valid raw pointer to the behavior for `self`, and this should be the
     /// only enqueueing of this request and behavior.
     unsafe fn start_enqueue(&self, behavior: *const Behavior) {
-        todo!()
+        let prev = unsafe {
+            self.target
+                .last()
+                .swap(self as *const Self as *mut Self, SeqCst)
+                .as_mut()
+        };
+        if let Some(prev) = prev {
+            while !prev.scheduled.load(SeqCst) {
+                hint::spin_loop();
+            }
+            prev.next.store(behavior as *mut Behavior, SeqCst);
+            return;
+        }
+        unsafe {
+            Behavior::resolve_one(behavior);
+        }
     }
 
     /// Finish the second phase of the 2PL enqueue operation.
@@ -67,7 +85,7 @@ impl Request {
     ///
     /// All enqueues for smaller requests on this cown must have been completed.
     unsafe fn finish_enqueue(&self) {
-        todo!()
+        self.scheduled.store(true, SeqCst);
     }
 
     /// Release the cown to the next behavior.
@@ -79,7 +97,27 @@ impl Request {
     ///
     /// `self` must have been actually completed.
     unsafe fn release(&self) {
-        todo!()
+        if self.next.load(SeqCst).is_null() {
+            if self
+                .target
+                .last()
+                .compare_exchange(
+                    self as *const Self as *mut Self,
+                    ptr::null_mut(),
+                    SeqCst,
+                    Relaxed,
+                )
+                .is_ok()
+            {
+                return;
+            }
+            while self.next.load(SeqCst).is_null() {
+                hint::spin_loop();
+            }
+        }
+        unsafe {
+            Behavior::resolve_one(self.next.load(SeqCst));
+        }
     }
 }
 
@@ -176,7 +214,16 @@ impl Behavior {
     /// Performs two phase locking (2PL) over the enqueuing of the requests.
     /// This ensures that the overall effect of the enqueue is atomic.
     fn schedule(self) {
-        todo!()
+        unsafe {
+            for r in &self.requests {
+                r.start_enqueue(&self as *const Self);
+            }
+            for r in &self.requests {
+                r.finish_enqueue();
+            }
+            Behavior::resolve_one(&self as *const Self);
+        }
+        // self dropped here
     }
 
     /// Resolves a single outstanding request for `this`.
@@ -188,7 +235,25 @@ impl Behavior {
     ///
     /// `this` must be a valid behavior.
     unsafe fn resolve_one(this: *const Self) {
-        todo!()
+        let tmp = unsafe { &*this };
+        if tmp.count.fetch_sub(1, SeqCst) != 1 {
+            return;
+        }
+        
+        let mut this = unsafe { Box::from_raw(this.cast_mut()) };
+        let thunk = this.thunk; // moved to spawned thread
+        this.thunk = Box::new(move || {}); // replace with a no-op
+        let requests = mem::take(&mut this.requests); // take ownership of requests
+        Box::leak(this); // the caller will drop this, so don't drop here
+        spawn(move || {
+            println!("running behavior");
+            (thunk)();
+            for r in &requests {
+                unsafe {
+                    r.release();
+                }
+            }
+        });
     }
 }
 
@@ -209,7 +274,17 @@ impl Behavior {
         C: CownPtrs + Send + 'static,
         F: for<'l> Fn(C::CownRefs<'l>) + Send + 'static,
     {
-        todo!()
+        let mut requests = cowns.requests();
+        requests.sort();
+        Self {
+            thunk: Box::new(move || {
+                f(unsafe {
+                    cowns.get_mut()
+                });
+            }),
+            count: AtomicUsize::new(requests.len() + 1),
+            requests,
+        }
     }
 }
 
@@ -381,4 +456,55 @@ fn boc_vec() {
 
     // wait for termination
     finish_receiver.recv().unwrap();
+}
+
+#[test]
+fn boc_thunk_move_all() {
+    let c1 = CownPtr::new(0);
+
+    let b = Box::new(Behavior::new(tuple_list!(c1), move |g1| {
+        println!("1")
+    }));
+    spawn(move || {
+        (b.thunk)();
+    });   
+}
+
+#[test]
+fn boc_thunk_move_thunk() {
+    let c1 = CownPtr::new(0);
+
+    let b = Box::new(Behavior::new(tuple_list!(c1), move |g1| {
+        println!("1")
+    }));
+    let thunk = b.thunk;
+    spawn(move || {
+        (thunk)();
+    });   
+}
+
+#[test]
+fn boc_one() {
+    let c1 = CownPtr::new(0);
+    let c2 = CownPtr::new(1);
+    let b = Behavior::new(tuple_list!(c1, c2), move |tuple_list!(g1, g2)| {
+        println!("{}", *g1);
+        println!("{}", *g2);
+    });
+    b.schedule();
+}
+
+#[test]
+fn boc_simple() {
+    let c1 = CownPtr::new(0);
+    let c2 = CownPtr::new(0);
+    let c3 = CownPtr::new(false);
+    let c2_ = c2.clone();
+    let c3_ = c3.clone();
+
+    when!(c1, c2; g1, g2; {
+        // c3, c2 are moved into this thunk. There's no such thing as auto-cloning move closure.
+        *g1 += 1;
+        *g2 += 1;
+    });
 }

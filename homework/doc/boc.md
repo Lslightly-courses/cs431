@@ -40,7 +40,7 @@ We provide several ways of using the when clause in Rust, illustrated below.
     `acc` is a vector of mutable references to the shared resources protected by the cowns,
     and it is guaranteed that `acc` has the same length as the specified given `Vec` of `CownPtr`s.
 
-More examples can be found in `src/boc.rs` and `test/boc.rs`.
+More examples can be found in `src/boc.rs` and `tests/boc.rs`.
 
 ## Grading (100 points)
 Run `./scripts/grade-boc.sh`.
