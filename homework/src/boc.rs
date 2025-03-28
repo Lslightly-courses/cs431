@@ -262,8 +262,8 @@ impl Behavior {
                     r.release();
                 }
             }
+            // behavior dropped here
         });
-        // drop the behavior
     }
 }
 
