@@ -255,11 +255,9 @@ impl Behavior {
         // No other threads share this. It's time to destroy it.
 
         let mut this = unsafe { Box::from_raw(this.cast_mut()) };
-        let thunk = mem::replace(&mut this.thunk, Box::new(move || {}));
-        let requests = mem::take(&mut this.requests);
         spawn(move || {
-            thunk();
-            for r in &requests {
+            (this.thunk)();
+            for r in &this.requests {
                 unsafe {
                     r.release();
                 }
