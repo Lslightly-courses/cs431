@@ -26,7 +26,7 @@ unsafe trait CownBase: Send {
 /// A request for a cown.
 pub struct Request {
     /// Pointer to the next scheduled behavior.
-    next: AtomicPtr<Behavior>,
+    next: AtomicPtr<Arc<Behavior>>,
     /// Is this request scheduled?
     scheduled: AtomicBool,
     /// The cown that this request wants to access.
@@ -59,7 +59,7 @@ impl Request {
     ///
     /// `behavior` must be a valid raw pointer to the behavior for `self`, and this should be the
     /// only enqueueing of this request and behavior.
-    unsafe fn start_enqueue(&self, behavior: *const Behavior) {
+    fn start_enqueue(&self, behavior: Arc<Behavior>) {
         let prev = unsafe {
             self.target
                 .last()
@@ -71,13 +71,11 @@ impl Request {
                 hint::spin_loop();
             }
             // notify the prev that current request is ready
-            prev.next.store(behavior as *mut Behavior, SeqCst);
+            prev.next.store(Box::into_raw(Box::new(behavior)), SeqCst);
             return;
         }
         // no prev exist, it's ok to go.
-        unsafe {
-            Behavior::resolve_one(behavior);
-        }
+        Behavior::resolve_one(behavior);
     }
 
     /// Finish the second phase of the 2PL enqueue operation.
@@ -87,7 +85,7 @@ impl Request {
     /// # Safety
     ///
     /// All enqueues for smaller requests on this cown must have been completed.
-    unsafe fn finish_enqueue(&self) {
+    fn finish_enqueue(&self) {
         self.scheduled.store(true, SeqCst);
     }
 
@@ -99,7 +97,7 @@ impl Request {
     /// # Safety
     ///
     /// `self` must have been actually completed.
-    unsafe fn release(&self) {
+    fn release(&self) {
         if self.next.load(SeqCst).is_null() {
             // (2)this is the last request for the cown,
             if self
@@ -122,9 +120,8 @@ impl Request {
             }
         }
         // (1)notify the successor to resolve one
-        unsafe {
-            Behavior::resolve_one(self.next.load(SeqCst));
-        }
+        let next = unsafe { Box::from_raw(self.next.swap(ptr::null_mut(), SeqCst)) };
+        Behavior::resolve_one(*next);
     }
 }
 
@@ -221,16 +218,14 @@ impl Behavior {
     /// Performs two phase locking (2PL) over the enqueuing of the requests.
     /// This ensures that the overall effect of the enqueue is atomic.
     fn schedule(self) {
-        let b = Box::leak(Box::new(self));
-        unsafe {
-            for r in &b.requests {
-                r.start_enqueue(b as *const Self);
-            }
-            for r in &b.requests {
-                r.finish_enqueue();
-            }
-            Behavior::resolve_one(b as *const Self);
+        let b = Arc::new(self);
+        for r in &b.requests {
+            r.start_enqueue(b.clone());
         }
+        for r in &b.requests {
+            r.finish_enqueue();
+        }
+        Behavior::resolve_one(b);
         // should not use mem::forget
         // Any resources the value manages, such as heap memory or a file handle,
         // will linger forever in an unreachable state. However, it does not guarantee
@@ -247,20 +242,19 @@ impl Behavior {
     /// # Safety
     ///
     /// `this` must be a valid behavior.
-    unsafe fn resolve_one(this: *const Self) {
-        let tmp = unsafe { &*this };
-        if tmp.count.fetch_sub(1, SeqCst) != 1 {
+    fn resolve_one(this: Arc<Self>) {
+        let count_res = Arc::into_inner(this);
+        if count_res.is_none() {
+            // this is not the last request
             return;
         }
-        // No other threads share this. It's time to destroy it.
 
-        let mut this = unsafe { Box::from_raw(this.cast_mut()) };
+        // No other threads share this. It's time to destroy it.
+        let this = count_res.unwrap();
         spawn(move || {
             (this.thunk)();
             for r in &this.requests {
-                unsafe {
-                    r.release();
-                }
+                r.release();
             }
             // behavior dropped here
         });

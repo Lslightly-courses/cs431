@@ -5,6 +5,7 @@
 // Allow lints for homework.
 #![allow(dead_code, unused_variables, unused_imports, unused_mut)]
 #![deny(unsafe_op_in_unsafe_fn, warnings)]
+#![allow(clippy::arc_with_non_send_sync)]
 
 mod adt;
 mod arc;
