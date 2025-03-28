@@ -12,6 +12,7 @@ required-features = ["build-bin"]
 [features]
 build-bin = ["ctrlc"]
 check-loom = ["loom"]
+drop-location = [] # enable this to see the drop location
 
 [dependencies]
 cfg-if = "1.0.0"

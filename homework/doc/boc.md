@@ -54,3 +54,7 @@ It will not affect the grading.
 
 ## Submission
 Submit `boc.rs` to gg.
+
+## Tips
+
+use `cargo test --features drop-location boc:: --lib -- --nocapture` to see where drops of behaviour happens.

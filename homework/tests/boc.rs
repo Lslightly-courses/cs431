@@ -49,7 +49,7 @@ mod boc_banking {
     use cs431_homework::boc::run_when;
     use cs431_homework::test::RandGen;
     use cs431_homework::{CownPtr, tuple_list, when};
-    use rand::thread_rng;
+    use rand::rng as thread_rng;
 
     const TRANSFER_LIMIT: usize = 2048;
 
@@ -386,7 +386,7 @@ mod basic_test {
 mod stress_test {
     use crossbeam_channel::{Receiver, Sender, bounded};
     use cs431_homework::test::RandGen;
-    use rand::thread_rng;
+    use rand::rng as thread_rng;
 
     use crate::{boc_banking, boc_fibonacci, boc_merge_sort};
 

@@ -4,6 +4,7 @@ use core::cell::UnsafeCell;
 use core::sync::atomic::Ordering::{Relaxed, SeqCst};
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize};
 use core::{fmt, hint, ptr};
+use std::backtrace::Backtrace;
 use std::mem;
 use std::sync::Arc;
 
@@ -69,9 +70,11 @@ impl Request {
             while !prev.scheduled.load(SeqCst) {
                 hint::spin_loop();
             }
+            // notify the prev that current request is ready
             prev.next.store(behavior as *mut Behavior, SeqCst);
             return;
         }
+        // no prev exist, it's ok to go.
         unsafe {
             Behavior::resolve_one(behavior);
         }
@@ -98,6 +101,7 @@ impl Request {
     /// `self` must have been actually completed.
     unsafe fn release(&self) {
         if self.next.load(SeqCst).is_null() {
+            // (2)this is the last request for the cown,
             if self
                 .target
                 .last()
@@ -111,10 +115,13 @@ impl Request {
             {
                 return;
             }
+            // (3) this is not the last request for the cown,
+            // wait for the next request to bet set
             while self.next.load(SeqCst).is_null() {
                 hint::spin_loop();
             }
         }
+        // (1)notify the successor to resolve one
         unsafe {
             Behavior::resolve_one(self.next.load(SeqCst));
         }
@@ -214,16 +221,22 @@ impl Behavior {
     /// Performs two phase locking (2PL) over the enqueuing of the requests.
     /// This ensures that the overall effect of the enqueue is atomic.
     fn schedule(self) {
+        let b = Box::leak(Box::new(self));
         unsafe {
-            for r in &self.requests {
-                r.start_enqueue(&self as *const Self);
+            for r in &b.requests {
+                r.start_enqueue(b as *const Self);
             }
-            for r in &self.requests {
+            for r in &b.requests {
                 r.finish_enqueue();
             }
-            Behavior::resolve_one(&self as *const Self);
+            Behavior::resolve_one(b as *const Self);
         }
-        // self dropped here
+        // should not use mem::forget
+        // Any resources the value manages, such as heap memory or a file handle,
+        // will linger forever in an unreachable state. However, it does not guarantee
+        // that pointers to this memory will remain valid.
+
+        // self should not drop here. resolve_one will drop it.
     }
 
     /// Resolves a single outstanding request for `this`.
@@ -239,21 +252,20 @@ impl Behavior {
         if tmp.count.fetch_sub(1, SeqCst) != 1 {
             return;
         }
-        
+        // No other threads share this. It's time to destroy it.
+
         let mut this = unsafe { Box::from_raw(this.cast_mut()) };
-        let thunk = this.thunk; // moved to spawned thread
-        this.thunk = Box::new(move || {}); // replace with a no-op
-        let requests = mem::take(&mut this.requests); // take ownership of requests
-        Box::leak(this); // the caller will drop this, so don't drop here
+        let thunk = mem::replace(&mut this.thunk, Box::new(move || {}));
+        let requests = mem::take(&mut this.requests);
         spawn(move || {
-            println!("running behavior");
-            (thunk)();
+            thunk();
             for r in &requests {
                 unsafe {
                     r.release();
                 }
             }
         });
+        // drop the behavior
     }
 }
 
@@ -278,13 +290,18 @@ impl Behavior {
         requests.sort();
         Self {
             thunk: Box::new(move || {
-                f(unsafe {
-                    cowns.get_mut()
-                });
+                f(unsafe { cowns.get_mut() });
             }),
             count: AtomicUsize::new(requests.len() + 1),
             requests,
         }
+    }
+}
+
+#[cfg(feature = "drop-location")]
+impl Drop for Behavior {
+    fn drop(&mut self) {
+        println!("{}", Backtrace::force_capture()); // see where behavior is dropped
     }
 }
 
@@ -369,7 +386,8 @@ where
     C: CownPtrs + Send + 'static,
     F: for<'l> Fn(C::CownRefs<'l>) + Send + 'static,
 {
-    Behavior::new(cowns, f).schedule();
+    let b = Behavior::new(cowns, f);
+    b.schedule();
 }
 
 /// from <https://docs.rs/tuple_list/latest/tuple_list/>
@@ -462,25 +480,21 @@ fn boc_vec() {
 fn boc_thunk_move_all() {
     let c1 = CownPtr::new(0);
 
-    let b = Box::new(Behavior::new(tuple_list!(c1), move |g1| {
-        println!("1")
-    }));
+    let mut b = Box::new(Behavior::new(tuple_list!(c1), move |g1| println!("1")));
     spawn(move || {
-        (b.thunk)();
-    });   
+        mem::replace(&mut b.thunk, Box::new(move || {}))();
+    });
 }
 
 #[test]
 fn boc_thunk_move_thunk() {
     let c1 = CownPtr::new(0);
 
-    let b = Box::new(Behavior::new(tuple_list!(c1), move |g1| {
-        println!("1")
-    }));
-    let thunk = b.thunk;
+    let mut b = Box::new(Behavior::new(tuple_list!(c1), move |g1| println!("1")));
+    let thunk = mem::replace(&mut b.thunk, Box::new(move || {}));
     spawn(move || {
         (thunk)();
-    });   
+    });
 }
 
 #[test]
@@ -506,5 +520,63 @@ fn boc_simple() {
         // c3, c2 are moved into this thunk. There's no such thing as auto-cloning move closure.
         *g1 += 1;
         *g2 += 1;
+        when!(c3, c2; g3, g2; {
+            *g2 += 1;
+            *g3 = true;
+        });
+    });
+}
+
+#[test]
+fn boc_channel() {
+    let c1 = CownPtr::new(1);
+    let c2 = CownPtr::new(2);
+    let c3 = CownPtr::new(true);
+    let c2_ = c2.clone();
+    let c3_ = c3.clone();
+
+    let (finish_sender, finish_receiver) = crossbeam_channel::bounded(0);
+
+    when!(c1, c2_, c3_; g1, g2, g3; {
+        assert_eq!(*g1, 1);
+        assert_eq!(*g2, if *g3 { 2 } else { 1 });
+        finish_sender.send(()).unwrap();
+    });
+
+    // wait for termination
+    finish_receiver.recv().unwrap();
+}
+
+#[test]
+fn boc_two_when_one_cown() {
+    let c1 = CownPtr::new(1);
+    when!(c1; g1; {
+        *g1 += 1;
+        println!("{}", *g1);
+    });
+
+    when!(c1; g1; {
+        *g1 += 1;
+        println!("{}", *g1);
+    });
+}
+
+#[test]
+fn boc_two_when_overlap_cown() {
+    let c1 = CownPtr::new(1);
+    let c2 = CownPtr::new(2);
+    let c3 = CownPtr::new(3);
+    when!(c1, c2; g1, g2; {
+        *g1 += 1;
+        *g2 += 1;
+        println!("{}", *g2);
+        assert_eq!(*g1+1, *g2);
+    });
+
+    println!("{}", unsafe { *c2.inner.value.get() });
+
+    when!(c2, c3; g2, g3; {
+        println!("{}", *g2);
+        assert_eq!(*g2, *g3);
     });
 }

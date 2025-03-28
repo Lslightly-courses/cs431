@@ -8,7 +8,7 @@
 # * TIMEOUT: default 10s
 
 export RUST_NIGHTLY=nightly
-rustup toolchain update stable nightly
+# rustup toolchain update stable nightly
 # rustup install $RUST_NIGHTLY
 # rustup component add rust-src --toolchain $RUST_NIGHTLY-x86_64-unknown-linux-gnu
 
