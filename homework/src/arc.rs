@@ -444,10 +444,11 @@ impl<T> Drop for Arc<T> {
     /// drop(foo2);   // Prints "dropped!"
     /// ```
     fn drop(&mut self) {
-        // TODO: reason not known yet
         // The following code does not work in check-loom mode.
         // self.inner().count.fetch_sub(1, Ordering::AcqRel);
         // if self.inner().count.load(Ordering::Acquire) == 0 {
+        // two threads may drop the same value at the same time
+        // the count of two threads can both be 0, and both threads enter the if block
 
         // pass the test in check-loom mode
         if self.inner().count.fetch_sub(1, Ordering::AcqRel) == 1 {
