@@ -332,6 +332,22 @@ mod basic_test {
     }
 
     #[test]
+    #[ignore]
+    fn merge_sort_3() {
+        let (send_finish, recv_finish) = bounded(0);
+
+        rayon::spawn(move || {
+            let mut arr = vec![3, 2, 1, 4, 6, 5];
+            let res = boc_merge_sort::merge_sort(arr.clone());
+            arr.sort();
+            assert_eq!(arr, res);
+
+            send_finish.send(()).unwrap();
+        });
+        recv_finish.recv().unwrap();
+    }
+
+    #[test]
     fn merge_sort() {
         let (send_finish, recv_finish) = bounded(0);
 

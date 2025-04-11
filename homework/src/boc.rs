@@ -10,19 +10,6 @@ use std::sync::Arc;
 
 use rayon::spawn;
 
-/// A trait representing a `Cown`.
-///
-/// Instead of directly using a `Cown<T>`, which fixes _a single_ `T` we use a trait object to allow
-/// multiple requests with different `T`s to be used with the same cown.
-///
-/// # Safety
-///
-/// `last` should actually return the last request for the corresponding cown.
-unsafe trait CownBase: Send {
-    /// Return a pointer to the tail of this cown's request queue.
-    fn last(&self) -> &AtomicPtr<Request>;
-}
-
 /// A request for a cown.
 pub struct Request {
     /// Pointer to the next scheduled behavior.
@@ -155,54 +142,6 @@ impl fmt::Debug for Request {
     }
 }
 
-/// The value should only be accessed inside a `when!` block.
-#[derive(Debug)]
-struct Cown<T: Send> {
-    /// MCS lock tail.
-    ///
-    /// When a new node is enqueued, the enqueuer of the previous tail node will wait until the
-    /// current enqueuer sets that node's `.next`.
-    last: AtomicPtr<Request>,
-    /// The value of this cown.
-    value: UnsafeCell<T>,
-}
-
-// SAFETY: `self.tail` is indeed the actual tail.
-unsafe impl<T: Send> CownBase for Cown<T> {
-    fn last(&self) -> &AtomicPtr<Request> {
-        &self.last
-    }
-}
-
-/// Public interface to Cown.
-#[derive(Debug)]
-pub struct CownPtr<T: Send> {
-    inner: Arc<Cown<T>>,
-}
-
-// SAFETY: In the basic version of BoC, user cannot get `&T`, so `Sync` is not necessary.
-unsafe impl<T: Send> Send for CownPtr<T> {}
-
-impl<T: Send> Clone for CownPtr<T> {
-    fn clone(&self) -> Self {
-        CownPtr {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<T: Send> CownPtr<T> {
-    /// Creates a new Cown.
-    pub fn new(value: T) -> CownPtr<T> {
-        CownPtr {
-            inner: Arc::new(Cown {
-                last: AtomicPtr::new(ptr::null_mut()),
-                value: UnsafeCell::new(value),
-            }),
-        }
-    }
-}
-
 type BehaviorThunk = Box<dyn FnOnce() + Send>;
 
 /// Behavior that captures the content of a when body.
@@ -216,6 +155,23 @@ struct Behavior {
 }
 
 impl Behavior {
+    // TODO: terminator?
+    fn new<C, F>(cowns: C, f: F) -> Behavior
+    where
+        C: CownPtrs + Send + 'static,
+        F: for<'l> Fn(C::CownRefs<'l>) + Send + 'static,
+    {
+        let mut requests = cowns.requests();
+        requests.sort();
+        Self {
+            thunk: Box::new(move || {
+                f(unsafe { cowns.get_mut() });
+            }),
+            count: AtomicUsize::new(requests.len() + 1),
+            requests,
+        }
+    }
+
     /// Schedules the Behavior.
     ///
     /// Performs two phase locking (2PL) over the enqueuing of the requests.
@@ -277,29 +233,71 @@ impl fmt::Debug for Behavior {
     }
 }
 
-// TODO: terminator?
-impl Behavior {
-    fn new<C, F>(cowns: C, f: F) -> Behavior
-    where
-        C: CownPtrs + Send + 'static,
-        F: for<'l> Fn(C::CownRefs<'l>) + Send + 'static,
-    {
-        let mut requests = cowns.requests();
-        requests.sort();
-        Self {
-            thunk: Box::new(move || {
-                f(unsafe { cowns.get_mut() });
-            }),
-            count: AtomicUsize::new(requests.len() + 1),
-            requests,
-        }
-    }
-}
-
 #[cfg(feature = "drop-location")]
 impl Drop for Behavior {
     fn drop(&mut self) {
         println!("{}", Backtrace::force_capture()); // see where behavior is dropped
+    }
+}
+
+/// A trait representing a `Cown`.
+///
+/// Instead of directly using a `Cown<T>`, which fixes _a single_ `T` we use a trait object to allow
+/// multiple requests with different `T`s to be used with the same cown.
+///
+/// # Safety
+///
+/// `last` should actually return the last request for the corresponding cown.
+unsafe trait CownBase: Send {
+    /// Return a pointer to the tail of this cown's request queue.
+    fn last(&self) -> &AtomicPtr<Request>;
+}
+
+/// The value should only be accessed inside a `when!` block.
+#[derive(Debug)]
+struct Cown<T: Send> {
+    /// MCS lock tail.
+    ///
+    /// When a new node is enqueued, the enqueuer of the previous tail node will wait until the
+    /// current enqueuer sets that node's `.next`.
+    last: AtomicPtr<Request>,
+    /// The value of this cown.
+    value: UnsafeCell<T>,
+}
+
+// SAFETY: `self.tail` is indeed the actual tail.
+unsafe impl<T: Send> CownBase for Cown<T> {
+    fn last(&self) -> &AtomicPtr<Request> {
+        &self.last
+    }
+}
+
+/// Public interface to Cown.
+#[derive(Debug)]
+pub struct CownPtr<T: Send> {
+    inner: Arc<Cown<T>>,
+}
+
+// SAFETY: In the basic version of BoC, user cannot get `&T`, so `Sync` is not necessary.
+unsafe impl<T: Send> Send for CownPtr<T> {}
+
+impl<T: Send> Clone for CownPtr<T> {
+    fn clone(&self) -> Self {
+        CownPtr {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T: Send> CownPtr<T> {
+    /// Creates a new Cown.
+    pub fn new(value: T) -> CownPtr<T> {
+        CownPtr {
+            inner: Arc::new(Cown {
+                last: AtomicPtr::new(ptr::null_mut()),
+                value: UnsafeCell::new(value),
+            }),
+        }
     }
 }
 
