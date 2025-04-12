@@ -44,7 +44,18 @@ impl<'g, T: Ord> Cursor<'g, T> {
     ///
     /// Return `Err(())` if the cursor cannot move.
     fn find(&mut self, key: &T, guard: &'g Guard) -> Result<bool, ()> {
-        todo!()
+        while self.prev.validate() {
+            if let Some(curr_node) = unsafe { self.curr.as_ref() } {
+                if curr_node.data == *key {
+                    return Ok(true);
+                }
+                self.prev = unsafe { curr_node.next.read_lock() };
+                self.curr = self.prev.load(SeqCst, guard);
+            } else {
+                return Ok(false);
+            }
+        }
+        Err(())
     }
 }
 
@@ -65,21 +76,69 @@ impl<T> OptimisticFineGrainedListSet<T> {
 
 impl<T: Ord> OptimisticFineGrainedListSet<T> {
     fn find<'g>(&'g self, key: &T, guard: &'g Guard) -> Result<(bool, Cursor<'g, T>), ()> {
-        todo!()
+        let mut cur = self.head(guard);
+        cur.find(key, guard).map(|found| {
+            (true, cur)
+        })
     }
 }
 
 impl<T: Ord> ConcurrentSet<T> for OptimisticFineGrainedListSet<T> {
     fn contains(&self, key: &T) -> bool {
-        todo!()
+        let guard = pin();
+        match self.find(key, &guard) {
+            Ok((found, _)) => found,
+            Err(_) => false,
+        }
     }
 
     fn insert(&self, key: T) -> bool {
-        todo!()
+        let guard = pin();
+        let mut cur = self.head(&guard);
+
+        'outer: loop {
+            if !cur.prev.validate() {
+                continue;
+            }
+            if let Some(curr_node) = unsafe { cur.curr.as_ref() } {
+                match curr_node.data.cmp(&key) {
+                    Less => {
+                        cur.prev = unsafe { curr_node.next.read_lock() };
+                        cur.curr = cur.prev.load(SeqCst, &guard);
+                    },
+                    Equal => return false,
+                    Greater => break 'outer,
+                }
+            } else {
+                break 'outer;
+            }
+        }
+
+        // Insert before the current node
+        let new_node = Node::new(key, cur.curr);
+        cur.prev.store(new_node, SeqCst);
+        return true;
     }
 
     fn remove(&self, key: &T) -> bool {
-        todo!()
+        let guard = pin();
+        loop {
+            if let Ok((found, mut cursor)) = self.find(key, &guard) {
+                if !found {
+                    return false;
+                }
+                if let Some(curr_node) = unsafe { cursor.curr.as_ref() } {
+                    if cursor.prev.validate() {
+                        let next_guard = unsafe { curr_node.next.read_lock() };
+                        while let Err(()) = cursor.prev.clone().upgrade() {}
+                        // todo upgrade to write lock
+                        todo!();
+                    }
+                }
+            } else {
+                // find failed, try again
+            }
+        }
     }
 }
 
