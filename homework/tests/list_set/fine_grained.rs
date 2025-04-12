@@ -64,7 +64,7 @@ fn iter_consistent() {
             handles.push(s.spawn(|| {
                 let mut rng = rand::rng();
                 for _ in 0..STEPS {
-                    let key = 2 * rng.random_range(0..50) + 1;
+                    let key = 2 * rng.random_range(0..50) + 1; // insert odd numbers
                     if rng.random() {
                         set.insert(key);
                     } else {
