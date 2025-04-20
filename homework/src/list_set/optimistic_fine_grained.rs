@@ -102,35 +102,43 @@ impl<T: Ord> ConcurrentSet<T> for OptimisticFineGrainedListSet<T> {
 
     fn insert(&self, key: T) -> bool {
         let guard = pin();
-        let mut cur = self.head(&guard);
 
         'outer: loop {
-            if !cur.prev.validate() {
+            let mut cur = self.head(&guard);
+            loop {
+                if !cur.prev.validate() {
+                    cur.prev.finish();
+                    continue 'outer;
+                }
+                if let Some(curr_node) = unsafe { cur.curr.as_ref() } {
+                    match curr_node.data.cmp(&key) {
+                        Less => {
+                            cur.prev.finish();
+                            cur.prev = unsafe { curr_node.next.read_lock() };
+                            cur.curr = cur.prev.load(SeqCst, &guard);
+                        }
+                        Equal => {
+                            cur.prev.finish(); // FUCK finish
+                            return false;
+                        }
+                        Greater => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            // Insert before the current node
+            let mut write_guard_result = cur.prev.upgrade();
+            if write_guard_result.is_err() {
                 continue;
             }
-            if let Some(curr_node) = unsafe { cur.curr.as_ref() } {
-                match curr_node.data.cmp(&key) {
-                    Less => {
-                        cur.prev.finish();
-                        cur.prev = unsafe { curr_node.next.read_lock() };
-                        cur.curr = cur.prev.load(SeqCst, &guard);
-                    }
-                    Equal => {
-                        cur.prev.finish(); // FUCK finish
-                        return false;
-                    }
-                    Greater => break 'outer,
-                }
-            } else {
-                break 'outer;
-            }
-        }
+            let write_guard = write_guard_result.unwrap();
 
-        // Insert before the current node
-        let new_node = Node::new(key, cur.curr);
-        let write_guard = cur.prev.upgrade().unwrap();
-        write_guard.store(new_node, SeqCst);
-        true
+            let new_node = Node::new(key, cur.curr);
+            write_guard.store(new_node, SeqCst);
+            return true;
+        }
     }
 
     fn remove(&self, key: &T) -> bool {
@@ -164,12 +172,13 @@ impl<T: Ord> ConcurrentSet<T> for OptimisticFineGrainedListSet<T> {
                             cursor.prev.finish();
                             continue 'outer; // retry because the previous node is invalid. It's destroyed by write lock.
                         }
-                        let write_guard = cursor.prev.upgrade().unwrap();
+                        let write_guard_result = cursor.prev.upgrade();
+                        if write_guard_result.is_err() {
+                            continue 'outer; // retry because the previous node is invalid. It's destroyed by write lock.
+                        }
+                        let write_guard = write_guard_result.unwrap();
                         let write_guard_next = curr_node.next.write_lock(); // !!! to invalidate iterator.
                         write_guard.store(write_guard_next.load(SeqCst, &guard), SeqCst);
-                        unsafe {
-                            guard.defer_destroy(cursor.curr);
-                        }
                         return true;
                     }
                     Greater => {
