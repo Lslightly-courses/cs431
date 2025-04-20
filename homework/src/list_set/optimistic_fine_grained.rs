@@ -1,5 +1,6 @@
 use std::cmp::Ordering::*;
-use std::mem::{self, ManuallyDrop};
+use std::fmt::write;
+use std::mem::{self, ManuallyDrop, replace, take};
 use std::sync::atomic::Ordering::*;
 
 use crossbeam_epoch::{Atomic, Guard, Owned, Shared, pin};
@@ -49,7 +50,8 @@ impl<'g, T: Ord> Cursor<'g, T> {
                 if curr_node.data == *key {
                     return Ok(true);
                 }
-                self.prev = unsafe { curr_node.next.read_lock() };
+                let prev = replace(&mut self.prev, unsafe { curr_node.next.read_lock() });
+                prev.finish();
                 self.curr = self.prev.load(SeqCst, guard);
             } else {
                 return Ok(false);
@@ -77,9 +79,12 @@ impl<T> OptimisticFineGrainedListSet<T> {
 impl<T: Ord> OptimisticFineGrainedListSet<T> {
     fn find<'g>(&'g self, key: &T, guard: &'g Guard) -> Result<(bool, Cursor<'g, T>), ()> {
         let mut cur = self.head(guard);
-        cur.find(key, guard).map(|found| {
-            (true, cur)
-        })
+        if let Ok(found) = cur.find(key, guard) {
+            Ok((found, cur))
+        } else {
+            cur.prev.finish();
+            Err(())
+        }
     }
 }
 
@@ -87,7 +92,10 @@ impl<T: Ord> ConcurrentSet<T> for OptimisticFineGrainedListSet<T> {
     fn contains(&self, key: &T) -> bool {
         let guard = pin();
         match self.find(key, &guard) {
-            Ok((found, _)) => found,
+            Ok((found, cursor)) => {
+                cursor.prev.finish();
+                found
+            }
             Err(_) => false,
         }
     }
@@ -103,10 +111,14 @@ impl<T: Ord> ConcurrentSet<T> for OptimisticFineGrainedListSet<T> {
             if let Some(curr_node) = unsafe { cur.curr.as_ref() } {
                 match curr_node.data.cmp(&key) {
                     Less => {
+                        cur.prev.finish();
                         cur.prev = unsafe { curr_node.next.read_lock() };
                         cur.curr = cur.prev.load(SeqCst, &guard);
-                    },
-                    Equal => return false,
+                    }
+                    Equal => {
+                        cur.prev.finish(); // FUCK finish
+                        return false;
+                    }
                     Greater => break 'outer,
                 }
             } else {
@@ -116,27 +128,52 @@ impl<T: Ord> ConcurrentSet<T> for OptimisticFineGrainedListSet<T> {
 
         // Insert before the current node
         let new_node = Node::new(key, cur.curr);
-        cur.prev.store(new_node, SeqCst);
-        return true;
+        if let Ok(write_guard) = cur.prev.upgrade() {
+            write_guard.store(new_node, SeqCst);
+        }
+        true
     }
 
     fn remove(&self, key: &T) -> bool {
+        /*
+           write lock the previous node
+        */
         let guard = pin();
-        loop {
-            if let Ok((found, mut cursor)) = self.find(key, &guard) {
-                if !found {
-                    return false;
-                }
-                if let Some(curr_node) = unsafe { cursor.curr.as_ref() } {
-                    if cursor.prev.validate() {
-                        let next_guard = unsafe { curr_node.next.read_lock() };
-                        while let Err(()) = cursor.prev.clone().upgrade() {}
-                        // todo upgrade to write lock
-                        todo!();
+
+        // deal with the first node
+        'outer: loop {
+            let mut cursor = self.head(&guard);
+            loop {
+                if cursor.prev.validate() {
+                    if let Some(curr_node) = unsafe { cursor.curr.as_ref() } {
+                        match curr_node.data.cmp(key) {
+                            Less => {
+                                cursor.prev.finish();
+                                cursor.prev = unsafe { curr_node.next.read_lock() };
+                                cursor.curr = cursor.prev.load(SeqCst, &guard);
+                            }
+                            Equal => {
+                                if !cursor.prev.validate() {
+                                    continue 'outer; // retry because the previous node is invalid. It's destroyed by write lock.
+                                }
+                                let write_guard = cursor.prev.upgrade().unwrap();
+                                let write_guiard_next = curr_node.next.write_lock(); // !!! to invalidate iterator.
+                                write_guard.store(write_guiard_next.load(SeqCst, &guard), SeqCst);
+                                unsafe {
+                                    guard.defer_destroy(cursor.curr);
+                                }
+                                return true;
+                            }
+                            Greater => {
+                                cursor.prev.finish();
+                                return false;
+                            }
+                        }
+                    } else {
+                        cursor.prev.finish();
+                        return false;
                     }
                 }
-            } else {
-                // find failed, try again
             }
         }
     }
@@ -164,13 +201,41 @@ impl<'g, T> Iterator for Iter<'g, T> {
     type Item = Result<&'g T, ()>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        todo!()
+        if !self.cursor.prev.validate() {
+            return Some(Err(()));
+        }
+        if let Some(curr_node) = unsafe { self.cursor.curr.as_ref() } {
+            let cur = unsafe { ManuallyDrop::take(&mut self.cursor) };
+            let next_prev_guard = unsafe { curr_node.next.read_lock() };
+            if !next_prev_guard.validate() {
+                return Some(Err(()));
+            }
+            let next_node = next_prev_guard.load(SeqCst, self.guard);
+            self.cursor = ManuallyDrop::new(Cursor {
+                prev: next_prev_guard,
+                curr: next_node,
+            });
+            cur.prev.finish();
+            Some(Ok(&curr_node.data))
+        } else {
+            None
+        }
     }
 }
 
 impl<T> Drop for OptimisticFineGrainedListSet<T> {
     fn drop(&mut self) {
-        todo!()
+        let guard = pin();
+        let read_guard = unsafe { self.head.read_lock() };
+        let mut cur_node = read_guard.load(SeqCst, &guard);
+        read_guard.finish();
+        while !cur_node.is_null() {
+            let node = unsafe { cur_node.into_owned() };
+            let read_guard = unsafe { node.next.read_lock() };
+            cur_node = read_guard.load(SeqCst, &guard);
+            read_guard.finish();
+            drop(node);
+        }
     }
 }
 
