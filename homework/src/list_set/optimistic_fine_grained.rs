@@ -128,9 +128,8 @@ impl<T: Ord> ConcurrentSet<T> for OptimisticFineGrainedListSet<T> {
 
         // Insert before the current node
         let new_node = Node::new(key, cur.curr);
-        if let Ok(write_guard) = cur.prev.upgrade() {
-            write_guard.store(new_node, SeqCst);
-        }
+        let write_guard = cur.prev.upgrade().unwrap();
+        write_guard.store(new_node, SeqCst);
         true
     }
 
@@ -144,32 +143,36 @@ impl<T: Ord> ConcurrentSet<T> for OptimisticFineGrainedListSet<T> {
         'outer: loop {
             let mut cursor = self.head(&guard);
             loop {
-                if cursor.prev.validate() {
-                    if let Some(curr_node) = unsafe { cursor.curr.as_ref() } {
-                        match curr_node.data.cmp(key) {
-                            Less => {
-                                cursor.prev.finish();
-                                cursor.prev = unsafe { curr_node.next.read_lock() };
-                                cursor.curr = cursor.prev.load(SeqCst, &guard);
-                            }
-                            Equal => {
-                                if !cursor.prev.validate() {
-                                    continue 'outer; // retry because the previous node is invalid. It's destroyed by write lock.
-                                }
-                                let write_guard = cursor.prev.upgrade().unwrap();
-                                let write_guiard_next = curr_node.next.write_lock(); // !!! to invalidate iterator.
-                                write_guard.store(write_guiard_next.load(SeqCst, &guard), SeqCst);
-                                unsafe {
-                                    guard.defer_destroy(cursor.curr);
-                                }
-                                return true;
-                            }
-                            Greater => {
-                                cursor.prev.finish();
-                                return false;
-                            }
+                if !cursor.prev.validate() {
+                    cursor.prev.finish();
+                    continue 'outer;
+                }
+                let cursor_ref = unsafe { cursor.curr.as_ref() };
+                if cursor_ref.is_none() {
+                    cursor.prev.finish();
+                    return false;
+                }
+                let curr_node = cursor_ref.unwrap();
+                match curr_node.data.cmp(key) {
+                    Less => {
+                        cursor.prev.finish();
+                        cursor.prev = unsafe { curr_node.next.read_lock() };
+                        cursor.curr = cursor.prev.load(SeqCst, &guard);
+                    }
+                    Equal => {
+                        if !cursor.prev.validate() {
+                            cursor.prev.finish();
+                            continue 'outer; // retry because the previous node is invalid. It's destroyed by write lock.
                         }
-                    } else {
+                        let write_guard = cursor.prev.upgrade().unwrap();
+                        let write_guard_next = curr_node.next.write_lock(); // !!! to invalidate iterator.
+                        write_guard.store(write_guard_next.load(SeqCst, &guard), SeqCst);
+                        unsafe {
+                            guard.defer_destroy(cursor.curr);
+                        }
+                        return true;
+                    }
+                    Greater => {
                         cursor.prev.finish();
                         return false;
                     }
@@ -204,22 +207,23 @@ impl<'g, T> Iterator for Iter<'g, T> {
         if !self.cursor.prev.validate() {
             return Some(Err(()));
         }
-        if let Some(curr_node) = unsafe { self.cursor.curr.as_ref() } {
-            let cur = unsafe { ManuallyDrop::take(&mut self.cursor) };
-            let next_prev_guard = unsafe { curr_node.next.read_lock() };
-            if !next_prev_guard.validate() {
-                return Some(Err(()));
-            }
-            let next_node = next_prev_guard.load(SeqCst, self.guard);
-            self.cursor = ManuallyDrop::new(Cursor {
-                prev: next_prev_guard,
-                curr: next_node,
-            });
+        let cursor_ref = unsafe { self.cursor.curr.as_ref() };
+        cursor_ref?;
+        let curr_node = cursor_ref.unwrap();
+        let cur = unsafe { ManuallyDrop::take(&mut self.cursor) };
+        let next_prev_guard = unsafe { curr_node.next.read_lock() };
+        if !next_prev_guard.validate() {
+            next_prev_guard.finish();
             cur.prev.finish();
-            Some(Ok(&curr_node.data))
-        } else {
-            None
+            return Some(Err(()));
         }
+        let next_node = next_prev_guard.load(SeqCst, self.guard);
+        self.cursor = ManuallyDrop::new(Cursor {
+            prev: next_prev_guard,
+            curr: next_node,
+        });
+        cur.prev.finish();
+        Some(Ok(&curr_node.data))
     }
 }
 
