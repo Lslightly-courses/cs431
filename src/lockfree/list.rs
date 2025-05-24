@@ -260,7 +260,7 @@ where
         // Release: to release current view of the deleting thread on this mark.
         // Acquire: to ensure that if the latter CAS succeeds, then the thread that reads `next`
         // through `prev` will be safe.
-        let next = curr_node.next.fetch_or(1, AcqRel, guard);
+        let next = curr_node.next.fetch_or(1, AcqRel, guard); // mark curr_node.next as logically removed
         if next.tag() == 1 {
             return Err(());
         }
