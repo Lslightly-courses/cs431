@@ -164,8 +164,23 @@ impl<T> Segment<T> {
     ///
     /// - `self` must actually have height `height`.
     /// - There should be no other references to possible children segments.
-    unsafe fn deallocate(self, height: usize) {
-        todo!()
+    unsafe fn deallocate(mut self, height: usize) {
+        if height == 1 {
+            // SAFETY: This is an element segment, so we can safely drop the elements.
+            unsafe { ManuallyDrop::drop(&mut self.elements) };
+        } else {
+            // SAFETY: This is an intermediate segment, so we can safely drop the children segments.
+            let guard = unsafe { crossbeam_epoch::unprotected() };
+            for child in unsafe { &self.children }.iter() {
+                unsafe {
+                    let child_seg = child.load(Relaxed, guard).into_owned();
+                    child_seg.into_box().deallocate(height - 1);
+                }
+            }
+            unsafe {
+                ManuallyDrop::drop(&mut self.children);
+            }
+        }
     }
 }
 
@@ -178,7 +193,12 @@ impl<T> Debug for Segment<T> {
 impl<T> Drop for GrowableArray<T> {
     /// Deallocate segments, but not the individual elements.
     fn drop(&mut self) {
-        todo!()
+        let guard = unsafe { crossbeam_epoch::unprotected() };
+        let root = self.root.load(Relaxed, guard);
+        let height = root.tag() as usize;
+        unsafe {
+            root.into_owned().into_box().deallocate(height);
+        }
     }
 }
 
@@ -186,6 +206,16 @@ impl<T> Default for GrowableArray<T> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+fn get_idx_seg_vec(index: usize) -> Vec<usize> {
+    let mut index_seg_vec = Vec::new();
+    let mut index = index;
+    while index > 0 {
+        index_seg_vec.push(index & ((1 << SEGMENT_LOGSIZE) - 1));
+        index >>= SEGMENT_LOGSIZE;
+    }
+    index_seg_vec
 }
 
 impl<T> GrowableArray<T> {
@@ -199,6 +229,57 @@ impl<T> GrowableArray<T> {
     /// Returns the reference to the `Atomic` pointer at `index`. Allocates new segments if
     /// necessary.
     pub fn get<'g>(&self, index: usize, guard: &'g Guard) -> &'g Atomic<T> {
-        todo!()
+        let mask = (1 << SEGMENT_LOGSIZE) - 1;
+        let index_seg_vec = get_idx_seg_vec(index);
+        let h_required = index_seg_vec.len();
+
+        let mut root_seg = self.root.load(SeqCst, guard);
+        while root_seg.tag() < h_required {
+            // Allocate a new segment and set it as the root.
+            let new_seg = Segment::<T>::new().with_tag(root_seg.tag() + 1);
+            if self
+                .root
+                .compare_exchange(root_seg, new_seg, SeqCst, Relaxed, guard)
+                .is_ok()
+            {
+                // updated root
+                root_seg = self.root.load(SeqCst, guard);
+            } else {
+                root_seg = self.root.load(SeqCst, guard);
+            }
+        }
+
+        let mut seg = root_seg;
+        for (i, index_seg) in index_seg_vec.iter().rev().enumerate() {
+            if i == h_required - 1 {
+                // This is the last segment, so we return the element.
+                let elements = unsafe { &seg.as_ref().unwrap().elements };
+                let element = &elements[*index_seg];
+                return element;
+            }
+            // This is an intermediate segment, so we traverse to the next segment.
+            let children = unsafe { &seg.as_ref().unwrap().children };
+            let child_seg = children[*index_seg].load(SeqCst, guard);
+            if child_seg.is_null() {
+                // Allocate a new segment and set it as the child.
+                let new_child_seg = Segment::<T>::new().with_tag(seg.tag() - 1);
+                if children[*index_seg]
+                    .compare_exchange(child_seg, new_child_seg, SeqCst, Relaxed, guard)
+                    .is_ok()
+                {
+                    seg = children[*index_seg].load(SeqCst, guard);
+                } else {
+                    // updated child
+                    seg = children[*index_seg].load(SeqCst, guard);
+                }
+            } else {
+                seg = child_seg;
+            }
+        }
+
+        panic!(
+            "GrowableArray::get: index {} is out of bounds for height {}",
+            index, h_required
+        );
     }
 }
