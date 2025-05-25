@@ -172,6 +172,9 @@ impl<T> Segment<T> {
             // SAFETY: This is an intermediate segment, so we can safely drop the children segments.
             let guard = unsafe { crossbeam_epoch::unprotected() };
             for child in unsafe { &self.children }.iter() {
+                if child.load(Relaxed, guard).is_null() {
+                    continue; // skip null children
+                }
                 unsafe {
                     let child_seg = child.load(Relaxed, guard).into_owned();
                     child_seg.into_box().deallocate(height - 1);
@@ -208,13 +211,22 @@ impl<T> Default for GrowableArray<T> {
     }
 }
 
+/// Convert an index to a vector of segments.
+///
+/// For example, if `SEGMENT_LOGSIZE = 3`, then the index `0b111011` will be converted to
+/// `vec![0b111, 0b011]`, which corresponds to the segments at height 2 and 1 respectively.
+#[inline]
 fn get_idx_seg_vec(index: usize) -> Vec<usize> {
     let mut index_seg_vec = Vec::new();
     let mut index = index;
-    while index > 0 {
+    loop {
         index_seg_vec.push(index & ((1 << SEGMENT_LOGSIZE) - 1));
         index >>= SEGMENT_LOGSIZE;
+        if index == 0 {
+            break;
+        }
     }
+    index_seg_vec.reverse();
     index_seg_vec
 }
 
@@ -226,51 +238,99 @@ impl<T> GrowableArray<T> {
         }
     }
 
-    /// Returns the reference to the `Atomic` pointer at `index`. Allocates new segments if
-    /// necessary.
-    pub fn get<'g>(&self, index: usize, guard: &'g Guard) -> &'g Atomic<T> {
-        let mask = (1 << SEGMENT_LOGSIZE) - 1;
-        let index_seg_vec = get_idx_seg_vec(index);
-        let h_required = index_seg_vec.len();
-
+    /// Increase the height of the root segment to at least `h_required`.
+    fn increase_height_to_needed(&self, h_required: usize, guard: &Guard) {
         let mut root_seg = self.root.load(SeqCst, guard);
         while root_seg.tag() < h_required {
             // Allocate a new segment and set it as the root.
             let new_seg = Segment::<T>::new().with_tag(root_seg.tag() + 1);
-            if self
+            match self
                 .root
                 .compare_exchange(root_seg, new_seg, SeqCst, Relaxed, guard)
-                .is_ok()
             {
-                // updated root
-                root_seg = self.root.load(SeqCst, guard);
-            } else {
-                root_seg = self.root.load(SeqCst, guard);
+                Ok(mut new) => {
+                    if root_seg.tag() == 0 {
+                        root_seg = new;
+                        unsafe {
+                            root_seg.deref_mut().children[0].store(Shared::null(), SeqCst);
+                        }
+                        continue;
+                    }
+                    unsafe {
+                        new.deref_mut().children[0].store(root_seg, SeqCst);
+                    }
+                    // updated root
+                    root_seg = new;
+                }
+                Err(e) => {
+                    // Another thread has already set this root, so we load it.
+                    root_seg = e.current;
+                }
             }
         }
+    }
 
-        let mut seg = root_seg;
-        for (i, index_seg) in index_seg_vec.iter().rev().enumerate() {
-            if i == h_required - 1 {
+    /// If the height of the root segment is larger than `h_required`, then return the segment whose
+    /// height is equal to `h_required`.
+    fn find_suitable_root<'g>(
+        &self,
+        h_required: usize,
+        guard: &'g Guard,
+    ) -> Shared<'g, Segment<T>> {
+        let mut root_seg = self.root.load(SeqCst, guard);
+        while root_seg.tag() > h_required {
+            unsafe {
+                let children = &root_seg.as_ref().unwrap().children;
+                // Get the first child segment, which is guaranteed to exist since we just increased
+                // the height of the root segment.
+                root_seg = children[0].load(SeqCst, guard);
+            }
+        }
+        if root_seg.tag() < h_required {
+            panic!(
+                "GrowableArray::find_suitable_root: height {} is larger than the root segment's height {}",
+                h_required,
+                root_seg.tag()
+            );
+        }
+        root_seg
+    }
+
+    /// Returns the reference to the `Atomic` pointer at `index`. Allocates new segments if
+    /// necessary.
+    pub fn get<'g>(&self, index: usize, guard: &'g Guard) -> &'g Atomic<T> {
+        let index_seg_vec = get_idx_seg_vec(index);
+        let h_required = index_seg_vec.len();
+
+        self.increase_height_to_needed(h_required, guard);
+        let mut seg = self.find_suitable_root(h_required, guard);
+
+        for index_seg in index_seg_vec {
+            if seg.tag() == 1 {
                 // This is the last segment, so we return the element.
                 let elements = unsafe { &seg.as_ref().unwrap().elements };
-                let element = &elements[*index_seg];
-                return element;
+                return &elements[index_seg];
             }
             // This is an intermediate segment, so we traverse to the next segment.
             let children = unsafe { &seg.as_ref().unwrap().children };
-            let child_seg = children[*index_seg].load(SeqCst, guard);
+            let child_seg = children[index_seg].load(SeqCst, guard);
             if child_seg.is_null() {
                 // Allocate a new segment and set it as the child.
                 let new_child_seg = Segment::<T>::new().with_tag(seg.tag() - 1);
-                if children[*index_seg]
-                    .compare_exchange(child_seg, new_child_seg, SeqCst, Relaxed, guard)
-                    .is_ok()
-                {
-                    seg = children[*index_seg].load(SeqCst, guard);
-                } else {
-                    // updated child
-                    seg = children[*index_seg].load(SeqCst, guard);
+                match children[index_seg].compare_exchange(
+                    child_seg,
+                    new_child_seg,
+                    SeqCst,
+                    Relaxed,
+                    guard,
+                ) {
+                    Ok(new) => {
+                        seg = new; // updated child
+                    }
+                    Err(e) => {
+                        // Another thread has already set this child, so we load it.
+                        seg = e.current;
+                    }
                 }
             } else {
                 seg = child_seg;
@@ -278,8 +338,10 @@ impl<T> GrowableArray<T> {
         }
 
         panic!(
-            "GrowableArray::get: index {} is out of bounds for height {}",
-            index, h_required
+            "GrowableArray::get: index (0x{:X}) is out of bounds for height {} at seg height {}",
+            index,
+            h_required,
+            seg.tag()
         );
     }
 }
