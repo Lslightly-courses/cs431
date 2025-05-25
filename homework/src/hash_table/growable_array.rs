@@ -3,6 +3,7 @@
 use core::fmt::Debug;
 use core::mem::{self, ManuallyDrop};
 use core::sync::atomic::Ordering::*;
+use std::ops::DerefMut;
 
 use crossbeam_epoch::{Atomic, Guard, Owned, Shared};
 
@@ -172,11 +173,11 @@ impl<T> Segment<T> {
             // SAFETY: This is an intermediate segment, so we can safely drop the children segments.
             let guard = unsafe { crossbeam_epoch::unprotected() };
             for child in unsafe { &self.children }.iter() {
-                if child.load(Relaxed, guard).is_null() {
+                if child.load(SeqCst, guard).is_null() {
                     continue; // skip null children
                 }
                 unsafe {
-                    let child_seg = child.load(Relaxed, guard).into_owned();
+                    let child_seg = child.load(SeqCst, guard).into_owned();
                     child_seg.into_box().deallocate(height - 1);
                 }
             }
@@ -197,7 +198,7 @@ impl<T> Drop for GrowableArray<T> {
     /// Deallocate segments, but not the individual elements.
     fn drop(&mut self) {
         let guard = unsafe { crossbeam_epoch::unprotected() };
-        let root = self.root.load(Relaxed, guard);
+        let root = self.root.load(SeqCst, guard);
         let height = root.tag() as usize;
         unsafe {
             root.into_owned().into_box().deallocate(height);
@@ -243,22 +244,22 @@ impl<T> GrowableArray<T> {
         let mut root_seg = self.root.load(SeqCst, guard);
         while root_seg.tag() < h_required {
             // Allocate a new segment and set it as the root.
-            let new_seg = Segment::<T>::new().with_tag(root_seg.tag() + 1);
+            let mut new_seg = Segment::<T>::new().with_tag(root_seg.tag() + 1);
+            if root_seg.tag() != 0 {
+                // if root_seg is not the initial null segment
+                unsafe {
+                    new_seg.deref_mut().children[0].store(root_seg, SeqCst);
+                }
+            } else {
+                unsafe {
+                    new_seg.deref_mut().children[0].store(Shared::null(), SeqCst); // initial segment has no children
+                }
+            }
             match self
                 .root
                 .compare_exchange(root_seg, new_seg, SeqCst, Relaxed, guard)
             {
                 Ok(mut new) => {
-                    if root_seg.tag() == 0 {
-                        root_seg = new;
-                        unsafe {
-                            root_seg.deref_mut().children[0].store(Shared::null(), SeqCst);
-                        }
-                        continue;
-                    }
-                    unsafe {
-                        new.deref_mut().children[0].store(root_seg, SeqCst);
-                    }
                     // updated root
                     root_seg = new;
                 }
